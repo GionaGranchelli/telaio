@@ -1,0 +1,27 @@
+# Gradle
+.gradle/
+build/
+out/
+!gradle/wrapper/gradle-wrapper.jar
+
+# IntelliJ Platform Plugin SDK & Sandboxes
+.intellijPlatform/
+system-test/
+config-test/
+plugins-test/
+log-test/
+
+# IDE & Editors
+.idea/
+*.iml
+*.iws
+*.ipr
+.fleet/
+.vscode/
+
+# OS and Environment
+.DS_Store
+Thumbs.db
+*.swp
+*~
+*.log

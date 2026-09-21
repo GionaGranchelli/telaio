@@ -1,0 +1,12 @@
+<idea-plugin>
+    <id>dev.telaio.intellij</id>
+    <name>Telaio JetBrains Bridge</name>
+    <vendor>Telaio</vendor>
+    <description>Governed semantic execution bridge for Telaio.</description>
+
+    <depends>com.intellij.modules.platform</depends>
+    <depends>org.jetbrains.kotlin</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+    </extensions>
+</idea-plugin>
