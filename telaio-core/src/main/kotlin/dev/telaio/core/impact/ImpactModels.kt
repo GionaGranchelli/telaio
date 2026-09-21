@@ -72,6 +72,11 @@ data class AnalysisLimitation(
     val affectedScope: AnalysisScope? = null
 )
 
+/**
+ * Dynamic risk indicators observed during static impact analysis.
+ * NOTE: Flags set to false indicate that no static evidence was observed,
+ * not a formal proof of absence of runtime dynamic behaviors.
+ */
 @Serializable
 data class DynamicRiskAssessment(
     val reflectionRisk: Boolean = false,
@@ -115,9 +120,6 @@ data class ImpactAnalysisRequest(
 ) {
     init {
         require(transactionId.isNotBlank()) { "transactionId must not be blank" }
-        require(transactionId == symbolHandle.transactionId) {
-            "Transaction ID mismatch: request transactionId '$transactionId' does not match handle transactionId '${symbolHandle.transactionId}'"
-        }
     }
 }
 

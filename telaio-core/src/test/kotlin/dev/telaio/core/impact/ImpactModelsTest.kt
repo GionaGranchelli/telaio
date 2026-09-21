@@ -24,13 +24,21 @@ class ImpactModelsTest {
         )
         assertEquals("txn-100", validRequest.transactionId)
 
-        // Transaction ID mismatch must fail
+        // Blank transactionId must fail
         assertFailsWith<IllegalArgumentException> {
             ImpactAnalysisRequest(
-                transactionId = "txn-different",
+                transactionId = "   ",
                 symbolHandle = handle
             )
         }
+
+        // Cross-transaction handle construction is permitted at DTO level so analyzer returns STALE_SYMBOL_HANDLE
+        val crossTxnRequest = ImpactAnalysisRequest(
+            transactionId = "txn-other",
+            symbolHandle = handle
+        )
+        assertEquals("txn-other", crossTxnRequest.transactionId)
+        assertEquals("txn-100", crossTxnRequest.symbolHandle.transactionId)
     }
 
     @Test

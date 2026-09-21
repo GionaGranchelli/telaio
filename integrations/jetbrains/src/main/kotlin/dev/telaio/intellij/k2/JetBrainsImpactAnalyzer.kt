@@ -1,9 +1,12 @@
+@file:OptIn(KaExperimentalApi::class)
+
 package dev.telaio.intellij.k2
 
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.application.ReadAction
 import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.module.ModuleUtilCore
+import com.intellij.openapi.progress.ProcessCanceledException
 import com.intellij.openapi.project.DumbService
 import com.intellij.openapi.project.Project
 import com.intellij.psi.*
@@ -19,10 +22,14 @@ import com.intellij.psi.util.PsiTreeUtil
 import dev.telaio.core.impact.*
 import dev.telaio.core.symbol.*
 import dev.telaio.intellij.bridge.TransactionSymbolRegistry
+import org.jetbrains.kotlin.analysis.api.KaExperimentalApi
+import org.jetbrains.kotlin.analysis.api.analyze
+import org.jetbrains.kotlin.analysis.api.symbols.KaCallableSymbol
 import org.jetbrains.kotlin.asJava.toLightMethods
 import org.jetbrains.kotlin.kdoc.psi.api.KDoc
 import org.jetbrains.kotlin.lexer.KtTokens
 import org.jetbrains.kotlin.psi.*
+import java.util.concurrent.CancellationException
 
 class JetBrainsImpactAnalyzer(
     private val project: Project,
@@ -113,6 +120,9 @@ class JetBrainsImpactAnalyzer(
                 executeSearch(request, entry.symbolRef, targetElement, startTime)
             }
         } catch (e: Throwable) {
+            if (e is ProcessCanceledException || e is CancellationException) {
+                throw e
+            }
             logger.error("Error during semantic impact analysis", e)
             val duration = System.currentTimeMillis() - startTime
             return ImpactAnalysisResult(
@@ -172,7 +182,7 @@ class JetBrainsImpactAnalyzer(
             )
         }
 
-        // 2. Hierarchy search: overrides & implementations (BR-6, AT-4)
+        // 2. Hierarchy search: overrides, implementations & base declarations (BR-6, AT-4)
         discoverHierarchyRelationships(targetElement, searchScope, semanticRelationships)
 
         // 3. Heuristic string literal search (BR-4, AT-10)
@@ -220,20 +230,24 @@ class JetBrainsImpactAnalyzer(
         )
 
         // 6. Blast Radius aggregation
-        val affectedFiles = sortedRelationships.map { it.sourceLocation.file }.distinct().sorted()
-        val affectedModules = sortedRelationships.mapNotNull { rel ->
+        val targetFile = targetElement.containingFile
+        val targetModule = targetFile?.let { ModuleUtilCore.findModuleForPsiElement(it)?.name }
+
+        val affectedFiles = (sortedRelationships.map { it.sourceLocation.file } + listOfNotNull(targetFile?.virtualFile?.path)).distinct().sorted()
+        val usageModules = sortedRelationships.mapNotNull { rel ->
             val psiFile = findPsiFile(rel.sourceLocation.file)
             psiFile?.let { ModuleUtilCore.findModuleForPsiElement(it)?.name }
-        }.distinct().sorted()
+        }
+        val affectedModules = (usageModules + listOfNotNull(targetModule)).distinct().sorted()
 
         val overrideCount = sortedRelationships.count { it.relationKind == SemanticRelationKind.OVERRIDE }
         val implementationCount = sortedRelationships.count { it.relationKind == SemanticRelationKind.IMPLEMENTATION }
 
         val blastRadius = BlastRadius(
             observedUsageCount = sortedRelationships.size,
-            affectedFilesCount = affectedFiles.size,
+            affectedFilesCount = sortedRelationships.map { it.sourceLocation.file }.distinct().size,
             affectedModulesCount = affectedModules.size,
-            affectedFiles = affectedFiles,
+            affectedFiles = sortedRelationships.map { it.sourceLocation.file }.distinct().sorted(),
             affectedModules = affectedModules,
             overrideCount = overrideCount,
             implementationCount = implementationCount
@@ -277,7 +291,11 @@ class JetBrainsImpactAnalyzer(
                 val file = element.containingFile
                 if (file != null) {
                     val module = ModuleUtilCore.findModuleForPsiElement(file)
-                    module?.moduleScope ?: GlobalSearchScope.projectScope(project)
+                    if (module != null) {
+                        GlobalSearchScope.moduleWithDependentsScope(module)
+                    } else {
+                        GlobalSearchScope.projectScope(project)
+                    }
                 } else {
                     GlobalSearchScope.projectScope(project)
                 }
@@ -397,6 +415,88 @@ class JetBrainsImpactAnalyzer(
                     relationships.add(
                         DiscoveredSemanticRelationship(
                             relationKind = relationKind,
+                            certainty = EvidenceCertainty.SEMANTICALLY_PROVEN,
+                            sourceLocation = location,
+                            enclosingDeclarationFqName = enclosingFqn,
+                            snippet = snippet
+                        )
+                    )
+                }
+            }
+        }
+
+        // 2. Upward hierarchy search: base declarations (BR-6)
+        discoverBaseDeclarations(targetElement, relationships, addedLocations)
+    }
+
+    private fun discoverBaseDeclarations(
+        targetElement: PsiElement,
+        relationships: MutableList<DiscoveredSemanticRelationship>,
+        addedLocations: MutableSet<Pair<String, Int?>>
+    ) {
+        if (targetElement is KtCallableDeclaration) {
+            analyze(targetElement) {
+                val symbol = targetElement.symbol as? KaCallableSymbol
+                val directlyOverriddenSymbols = symbol?.directlyOverriddenSymbols
+                if (directlyOverriddenSymbols != null) {
+                    for (superSym in directlyOverriddenSymbols) {
+                        val superPsi = superSym.psi
+                        if (superPsi != null && superPsi != targetElement) {
+                            val location = extractSourceLocation(superPsi)
+                            if (addedLocations.add(location.file to location.offset)) {
+                                val enclosingFqn = findEnclosingDeclarationFqn(superPsi)
+                                val snippet = extractSnippet(superPsi)
+                                relationships.add(
+                                    DiscoveredSemanticRelationship(
+                                        relationKind = SemanticRelationKind.BASE_DECLARATION,
+                                        certainty = EvidenceCertainty.SEMANTICALLY_PROVEN,
+                                        sourceLocation = location,
+                                        enclosingDeclarationFqName = enclosingFqn,
+                                        snippet = snippet
+                                    )
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (targetElement is KtNamedFunction) {
+            val lightMethods = targetElement.toLightMethods()
+            for (lightMethod in lightMethods) {
+                val superMethods = lightMethod.findSuperMethods(false)
+                for (sm in superMethods) {
+                    val superPsi = sm.navigationElement ?: sm
+                    if (superPsi == targetElement) continue
+                    val location = extractSourceLocation(superPsi)
+                    if (addedLocations.add(location.file to location.offset)) {
+                        val enclosingFqn = findEnclosingDeclarationFqn(superPsi)
+                        val snippet = extractSnippet(superPsi)
+                        relationships.add(
+                            DiscoveredSemanticRelationship(
+                                relationKind = SemanticRelationKind.BASE_DECLARATION,
+                                certainty = EvidenceCertainty.SEMANTICALLY_PROVEN,
+                                sourceLocation = location,
+                                enclosingDeclarationFqName = enclosingFqn,
+                                snippet = snippet
+                            )
+                        )
+                    }
+                }
+            }
+        } else if (targetElement is PsiMethod) {
+            val superMethods = targetElement.findSuperMethods(false)
+            for (sm in superMethods) {
+                val superPsi = sm.navigationElement ?: sm
+                if (superPsi == targetElement) continue
+                val location = extractSourceLocation(superPsi)
+                if (addedLocations.add(location.file to location.offset)) {
+                    val enclosingFqn = findEnclosingDeclarationFqn(superPsi)
+                    val snippet = extractSnippet(superPsi)
+                    relationships.add(
+                        DiscoveredSemanticRelationship(
+                            relationKind = SemanticRelationKind.BASE_DECLARATION,
                             certainty = EvidenceCertainty.SEMANTICALLY_PROVEN,
                             sourceLocation = location,
                             enclosingDeclarationFqName = enclosingFqn,

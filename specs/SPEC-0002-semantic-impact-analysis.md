@@ -138,7 +138,7 @@ data class ImpactAnalysisRequest(
 @Serializable
 enum class AnalysisScope {
     LOCAL,      // Enclosing file / class / local block
-    MODULE,     // Owning module
+    MODULE,     // Owning module and dependent consumer modules (moduleWithDependentsScope)
     PROJECT     // Complete IntelliJ project workspace
 }
 

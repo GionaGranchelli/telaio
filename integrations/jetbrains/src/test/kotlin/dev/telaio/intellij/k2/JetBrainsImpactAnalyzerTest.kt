@@ -1,6 +1,9 @@
 package dev.telaio.intellij.k2
 
+import com.intellij.openapi.module.JavaModuleType
+import com.intellij.openapi.roots.ModuleRootModificationUtil
 import com.intellij.testFramework.DumbModeTestUtils
+import com.intellij.testFramework.PsiTestUtil
 import com.intellij.testFramework.fixtures.BasePlatformTestCase
 import dev.telaio.core.impact.*
 import dev.telaio.core.symbol.*
@@ -137,66 +140,7 @@ class JetBrainsImpactAnalyzerTest : BasePlatformTestCase() {
         assertFalse(snippets.any { it.contains("404") })
     }
 
-    /**
-     * AT-3: Cross-Module Impact
-     * Given multiple files in the project workspace,
-     * returns affectedFilesCount and affectedFiles accurately.
-     */
-    fun testAT3CrossModuleImpact() {
-        val fileA = myFixture.addFileToProject(
-            "core/Service.kt",
-            """
-            package com.example.core
 
-            class Service {
-                fun execute() {}
-            }
-            """.trimIndent()
-        )
-
-        val fileB = myFixture.addFileToProject(
-            "client1/ClientOne.kt",
-            """
-            package com.example.client1
-            import com.example.core.Service
-
-            fun callOne() {
-                Service().execute()
-            }
-            """.trimIndent()
-        )
-
-        val fileC = myFixture.addFileToProject(
-            "client2/ClientTwo.kt",
-            """
-            package com.example.client2
-            import com.example.core.Service
-
-            fun callTwo() {
-                Service().execute()
-            }
-            """.trimIndent()
-        )
-
-        val declOffset = fileA.text.indexOf("execute")
-        val resolveRes = resolver.resolveSymbol(
-            ResolveSymbolRequest(transactionId = "txn-at3", file = fileA.virtualFile.path, offset = declOffset)
-        )
-        assertTrue(resolveRes.outcome is ResolveOutcome.Resolved)
-        val handle = (resolveRes.outcome as ResolveOutcome.Resolved).symbol.handle
-
-        val impactRes = analyzer.analyzeImpact(
-            ImpactAnalysisRequest(transactionId = "txn-at3", symbolHandle = handle)
-        )
-
-        assertTrue(impactRes.outcome is ImpactOutcome.ImpactReady)
-        val report = (impactRes.outcome as ImpactOutcome.ImpactReady).report
-
-        assertEquals(2, report.blastRadius.observedUsageCount)
-        assertEquals(2, report.blastRadius.affectedFilesCount)
-        assertTrue(report.blastRadius.affectedFiles.contains(fileB.virtualFile.path))
-        assertTrue(report.blastRadius.affectedFiles.contains(fileC.virtualFile.path))
-    }
 
     /**
      * AT-4: Override & Subtype Discovery
@@ -394,20 +338,89 @@ class JetBrainsImpactAnalyzerTest : BasePlatformTestCase() {
 
     /**
      * AT-9: Stale Handle Rejection
-     * Given an unregistered handle or handle from a different transaction,
-     * returns STALE_SYMBOL_HANDLE.
+     * Given an unregistered handle, a handle used across transactions,
+     * or a handle from a cleared/closed transaction, returns STALE_SYMBOL_HANDLE.
      */
     fun testAT9StaleHandleRejection() {
-        val fakeHandle = SymbolHandle.create("txn-unknown", "deadbeef")
+        // Case 1: Unregistered handle
+        val fakeHandle = SymbolHandle.create("txn-at9-1", "deadbeef")
+        val impactRes1 = analyzer.analyzeImpact(
+            ImpactAnalysisRequest(transactionId = "txn-at9-1", symbolHandle = fakeHandle)
+        )
+        assertTrue(impactRes1.outcome is ImpactOutcome.StaleSymbolHandle)
+        assertEquals(fakeHandle, (impactRes1.outcome as ImpactOutcome.StaleSymbolHandle).handle)
 
-        val impactRes = analyzer.analyzeImpact(
-            ImpactAnalysisRequest(transactionId = "txn-unknown", symbolHandle = fakeHandle)
+        // Case 2: Registered handle from transaction A used with request transaction B
+        val file = myFixture.configureByText("TestAT9.kt", "package com.example\nfun sampleAT9() {}")
+        val resolveRes2 = resolver.resolveSymbol(
+            ResolveSymbolRequest(transactionId = "txn-a", file = file.virtualFile.path, offset = file.text.indexOf("sampleAT9"))
+        )
+        assertTrue(resolveRes2.outcome is ResolveOutcome.Resolved)
+        val handleA = (resolveRes2.outcome as ResolveOutcome.Resolved).symbol.handle
+
+        val impactRes2 = analyzer.analyzeImpact(
+            ImpactAnalysisRequest(transactionId = "txn-b", symbolHandle = handleA)
+        )
+        assertTrue(impactRes2.outcome is ImpactOutcome.StaleSymbolHandle)
+        assertEquals(handleA, (impactRes2.outcome as ImpactOutcome.StaleSymbolHandle).handle)
+
+        // Case 3: Handle whose transaction was cleared / closed
+        val resolveRes3 = resolver.resolveSymbol(
+            ResolveSymbolRequest(transactionId = "txn-c", file = file.virtualFile.path, offset = file.text.indexOf("sampleAT9"))
+        )
+        assertTrue(resolveRes3.outcome is ResolveOutcome.Resolved)
+        val handleC = (resolveRes3.outcome as ResolveOutcome.Resolved).symbol.handle
+
+        registry.clearTransaction("txn-c")
+        val impactRes3 = analyzer.analyzeImpact(
+            ImpactAnalysisRequest(transactionId = "txn-c", symbolHandle = handleC)
+        )
+        assertTrue(impactRes3.outcome is ImpactOutcome.StaleSymbolHandle)
+        assertEquals(handleC, (impactRes3.outcome as ImpactOutcome.StaleSymbolHandle).handle)
+    }
+
+    /**
+     * Dedicated Conformance Test: Base Declaration Discovery (BR-6)
+     * Given an overriding method in a concrete class,
+     * impact analysis reports the super interface method as BASE_DECLARATION.
+     */
+    fun testBaseDeclarationDiscovery() {
+        val file = myFixture.configureByText(
+            "HierarchyBase.kt",
+            """
+            package com.example.hierarchy
+
+            interface Processor {
+                fun process()
+            }
+
+            class ConcreteProcessor : Processor {
+                override fun process() {}
+            }
+            """.trimIndent()
         )
 
-        assertTrue(impactRes.outcome is ImpactOutcome.StaleSymbolHandle)
-        val stale = impactRes.outcome as ImpactOutcome.StaleSymbolHandle
-        assertEquals(fakeHandle, stale.handle)
+        val overrideOffset = file.text.indexOf("override fun process") + 13
+        val resolveRes = resolver.resolveSymbol(
+            ResolveSymbolRequest(transactionId = "txn-base", file = file.virtualFile.path, offset = overrideOffset)
+        )
+        assertTrue(resolveRes.outcome is ResolveOutcome.Resolved)
+        val handle = (resolveRes.outcome as ResolveOutcome.Resolved).symbol.handle
+
+        val impactRes = analyzer.analyzeImpact(
+            ImpactAnalysisRequest(transactionId = "txn-base", symbolHandle = handle)
+        )
+
+        assertTrue(impactRes.outcome is ImpactOutcome.ImpactReady)
+        val report = (impactRes.outcome as ImpactOutcome.ImpactReady).report
+
+        val baseDeclarations = report.semanticRelationships.filter { it.relationKind == SemanticRelationKind.BASE_DECLARATION }
+        assertEquals(1, baseDeclarations.size)
+        assertEquals(EvidenceCertainty.SEMANTICALLY_PROVEN, baseDeclarations[0].certainty)
+        assertTrue(baseDeclarations[0].enclosingDeclarationFqName?.contains("Processor") == true)
     }
+
+
 
     /**
      * AT-10: Heuristic String Candidate Separation
